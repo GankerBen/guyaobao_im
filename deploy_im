@@ -1,0 +1,153 @@
+#角色列表
+
+zookeeper
+kafka
+
+logic: 客户端通过该服务的HTTP接口发送消息，logic再将消息转发给kafka，在kafka模型中扮演producer(无状态)
+job：负责从kafka拉取消息，然后转发给所有的comet，在kafka模型中扮演consumer(无状态)
+comet：保持tcp和websocket长连接的服务，负责实时推送消息给客户端(有状态)
+router：存储消息订阅者(客户端)简要信息的服务(比如记录了某个客户端连接了哪个comet)(有状态)
+
+如上每个服务包含三个部分的资源：
+
+logic: 
+    -logic
+    -logic.conf
+    -logic-log.xml
+
+job：
+    -job
+    -job.conf
+    -job-log.xml
+
+comet：
+    -comet
+    -comet.conf
+    -comet-log.xml
+
+router：
+    -router
+    -router.conf
+    -router-log.xml
+
+*.conf为对应服务的配置文件，所有服务启动方式均为 /path/to/service -c /path/to/service.conf
+
+所有服务内部都使用了log4go日志库，*.xml用于定义日志的具体格式，最终由日志库识别，服务需要知道*.xml
+的文件位置，这在*.conf中配置(*.conf中的log部分，请参考配置文件内容)
+
+注意：由于使用了supervisor做守护进程，请使用绝对路径进行配置。
+
+#服务启动顺序
+
+1.启动zookeeper
+2.启动kafka
+3.用kafka创建topic，请参见create_topics.sh
+4.启动router
+5.启动logic
+6.启动comet
+7.启动job
+
+# 服务依赖关系
+1.kafka依赖zookeeper，这一部分请参考官方教程。
+
+2.logic依赖router，在logic.conf中，需要配置router的地址：
+
+-----------------------------------------------------------
+----------如下片段引用logic.conf---------------------------
+[router.addrs]
+# 单台
+1 tcp@localhost:7270
+# 如果集群
+#2 tcp@localhost:7271
+#3 tcp@localhost:7272
+
+格式总结：
+routerID tcp@ip:port
+routerID 请确保是集群唯一的
+------------------------------------------------------------
+
+3.logic依赖kafka，在logic.conf中，需要配置kafka的地址：
+
+------------------------------------------------------------
+----------如下片段引用logic.conf---------------------------
+[kafka]
+addrs 127.0.0.1:9092
+# 如果集群
+# addrs ip1:port,ip2:port,ip3:port
+
+格式总结：
+addrs ip:port,ip:port,ip:port
+------------------------------------------------------------
+
+4.job依赖zookeeper、kafka，在job.conf中，需要配置zookeeper的地址：
+
+----------如下片段引用job.conf---------------------------
+[kafka]
+zookeeper.list 127.0.0.1:2181
+# 如果集群
+# zookeeper.list ip1:port,ip2:port,ip3:port
+
+# kafka创建的主题，对应的是create_topics.sh中创建的主题
+topic KafkaPushsTopic
+-------------------------------------------------------------
+
+5.job依赖comet，在job.conf中，需要配置comet的地址：
+
+----------如下片段引用job.conf---------------------------
+[comets]
+# comet server address list
+1 tcp@127.0.0.1:8092
+
+# 如果集群
+#2 tcp@127.0.0.2:8092
+#3 tcp@127.0.0.3:8092
+
+格式总结：
+cometID ip:port,ip:port,ip:port
+# cometID 需要集群唯一，comet.conf中有一行叫server.id，即配置comet的ID，请注意cometID与comet地址的对应关系，router也如此。
+---------------------------------------------------------------
+
+6.comet依赖logic，在comet.conf中，需要配置logic的地址：
+
+----------如下片段引用comet.conf---------------------------
+[logic]
+# logic service rpc address
+#
+# Examples:
+#
+# rpc.addrs tcp@localhost:7170
+rpc.addrs tcp@localhost:7170
+
+# 如果集群
+# rpc.addrs tcp@ip1:port,tcp@ip2:port,tcp@ip3:port
+#
+-------------------------------------------------------------
+
+# 服务之间交互
+服务器之间交互都是通过RPC实现，如上所述，所有依赖的服务地址都是RPC地址。
+比如comet依赖logic，那么在这一层依赖关系中，comet扮演客户端，logic扮演服务端，
+服务端需要bind到一个RPC地址上，比如请参见logic.conf：
+
+rpc.addrs tcp@localhost:7170
+
+就表示logic内部有一个RPC服务，请以此类推。
+
+# 服务到客户端交互
+1.HTTP(logic独有)
+客户端通过该服务发送消息
+
+2.TCP and Websocket(comet独有)
+客户端通过这两个中的某个服务订阅实时消息(对于胖客户端，请使用TCP提高性能，咱们用的是websocket)
+
+# 数据流
+
+1.客户端从业务系统拿到两个数据：UID，ROOMID后，与comet建立长连接，并发送订阅请求{uid: UID, rid: ROOMID}
+2.comet解析订阅请求，并转发给logic处理订阅逻辑{uid:UID, rid: ROOMID, cometID: cometID}
+3.logic根据UID做一致性哈西映射，找到一个router，并转发请求给router，router存储该用户信息。
+4.逐层返回，客户端订阅消息成功。
+5.客户端通过logic提供的HTTP服务发送消息。
+6.logic将消息转发给kafka
+7.job一直尝试从kafka拉取消息，并根据消息的自定义header，转发给相应的comet
+8.comet根据消息的相关信息，广播给某个ROOMID下所有的用户，或者根据UID，单发给某个用户
+
+# 温馨提醒，请将AWS上面的IM目录作为参考，其中包含了如上所述的所有资源依赖。
